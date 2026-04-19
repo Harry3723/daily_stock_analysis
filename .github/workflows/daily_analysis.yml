@@ -309,3 +309,17 @@ jobs:
             echo "📜 最近日志（最后 30 行）:"
             tail -30 logs/stock_analysis_*.log 2>/dev/null || echo "无日志"
           fi
+      - name: Send Email (Force)
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.office365.com
+          server_port: 587
+          secure: true
+          username: ${{ secrets.EMAIL_SENDER }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: "📈 Stock Analysis Report"
+          to: ${{ secrets.EMAIL_RECEIVERS }}
+          from: ${{ secrets.EMAIL_SENDER }}
+          attachments: reports/*.md
+          body: |
+            Your stock analysis report is attached.    
