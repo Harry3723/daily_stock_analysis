@@ -154,7 +154,8 @@ Use channel mode: set `LLM_CHANNELS=aihubmix,deepseek,gemini` and configure each
 **Solution**:
 1. **Auto-chunking**: Latest version implements automatic long message splitting
 2. **Single stock push mode**: Set `SINGLE_STOCK_NOTIFY=true`, push immediately after each stock analysis
-3. **Brief report**: Set `REPORT_TYPE=simple` for simplified format
+3. **Mobile-friendly format**: Set `REPORT_TYPE=simple` for compact blocks that keep key citations
+4. **Ultra-short overview**: Set `REPORT_TYPE=brief` if you only need a 3-5 sentence summary
 
 ---
 

@@ -1769,6 +1769,13 @@ class GeminiAnalyzer:
 - This includes `stock_name`, `trend_prediction`, `operation_advice`, `confidence_level`, all nested dashboard text, checklist items, and every summary field.
 - Use the common English company name when you are confident. If not, keep the listed company name rather than inventing one.
 - When data is missing, explain it in English instead of Chinese.
+
+### Evidence requirements (highest priority)
+- `dashboard.intelligence.latest_news`, `risk_alerts`, `positive_catalysts`, `earnings_outlook`, `sentiment_summary`, `news_summary`, `market_sentiment`, `fundamental_analysis`, `analysis_summary`, and `data_sources` must be grounded in the provided search/fundamental context.
+- Every non-empty qualitative statement above must end with an explicit evidence marker such as `[Source: 2026-04-20 Reuters "Headline"]`.
+- Do not write unsupported lines like "market sentiment is neutral" or "earnings outlook is improving" without saying what evidence supports that judgment.
+- When you call sentiment neutral/positive/cautious, briefly explain how you inferred it from the retrieved news / announcements / earnings clues.
+- If evidence is missing, write an explicit missing-data note instead of leaving the field empty or guessing.
 """
         else:
             prompt += f"""
@@ -1778,8 +1785,15 @@ class GeminiAnalyzer:
 - `decision_type` 必须保持为 `buy`、`hold`、`sell`。
 - 所有面向用户的人类可读文本值必须使用中文。
 - 当数据缺失时，请使用中文直接说明“{no_data_text}，无法判断”。
+
+### 证据引用要求（最高优先级）
+- `dashboard.intelligence.latest_news`、`risk_alerts`、`positive_catalysts`、`earnings_outlook`、`sentiment_summary`、`news_summary`、`market_sentiment`、`fundamental_analysis`、`analysis_summary`、`data_sources` 这些字段都必须基于上方提供的检索/基本面上下文。
+- 上述字段里只要写了定性结论，就必须在句末加显式依据，例如：`【依据：2026-04-20 财联社《标题》】`。
+- 禁止写“市场情绪中性”“业绩预期改善”“消息面偏暖”这类无依据判断；必须说明你是根据哪些新闻/公告/业绩线索得出的。
+- 当你判断“市场情绪中性/偏积极/偏谨慎”时，必须补一句你是如何从近期新闻、公告、业绩线索中归纳出来的。
+- 如果缺少足够依据，就明确写“信息缺失：……”或“{no_data_text}，无法判断”，不要留空，也不要猜测。
 """
-        
+
         return prompt
     
     def _format_volume(self, volume: Optional[float]) -> str:

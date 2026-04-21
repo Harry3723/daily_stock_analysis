@@ -32,6 +32,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - [新功能] 集成 Anspire Search 作为可选语义搜索后端; 配置 `ANSPIRE_*` 可使用Anspire Search获取实时行情及新闻资讯，未配置时行为与此前一致。Anspire Search请使用 `tests/test_anspire_search.py`（手动脚本）。
 
+- [修复] 多维情报搜索为 `market_analysis` / `industry` / `earnings` 维度使用更长检索窗口，并在首个 provider 无结果时继续尝试后续 provider，减少每日推送中业绩预期与机构/行业信息长期缺失的问题。
+- [改进] `StockAnalysisPipeline` 现在会把检索结果与结构化基本面程序化回填到 `latest_news` / `earnings_outlook` / `market_sentiment` / `news_summary` / `fundamental_analysis` / `analysis_summary` / `data_sources`；有依据时强制附加引用，缺依据时明确写出“信息缺失”。
+- [测试] 补充情报搜索窗口/多 provider 回退/证据回填回归测试，覆盖业绩维度 45 日窗口、格式化情报报告的缺失记录、以及最终结果中的引用补全与缺失说明。
+- [改进] `REPORT_TYPE=simple` 的通知文案改为手机优先短块格式：压缩单股/汇总推送长度，保留关键引用与价位信息，减少长段落和表格在手机通知中的折叠与截断。
+
 ## [3.12.0] - 2026-04-01
 
 ### 发布亮点

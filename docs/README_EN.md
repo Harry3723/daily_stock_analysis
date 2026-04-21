@@ -124,7 +124,7 @@ Go to your forked repo → `Settings` → `Secrets and variables` → `Actions` 
 | `CUSTOM_WEBHOOK_URLS` | Custom Webhook URLs (supports DingTalk, etc., comma-separated) | Optional |
 | `CUSTOM_WEBHOOK_BEARER_TOKEN` | Bearer token for custom webhooks (if required) | Optional |
 | `SINGLE_STOCK_NOTIFY` | Send notification immediately after each stock | Optional |
-| `REPORT_TYPE` | `simple`, `full`, or `brief` (Docker recommended: `full`) | Optional |
+| `REPORT_TYPE` | `simple` (mobile-first compact blocks with citations), `full`, or `brief` (ultra-summary; Docker recommended: `full`) | Optional |
 | `REPORT_LANGUAGE` | Report output language: `zh` (default Chinese) / `en` (English); affects prompt instructions, Markdown templates, notification fallbacks, and fixed labels in the Web report view | Optional |
 | `ANALYSIS_DELAY` | Delay between stocks and market review (seconds) | Optional |
 
@@ -422,7 +422,7 @@ PUSHPLUS_TOKEN=your_token_here
 ```bash
 # === Analysis Behavior ===
 ANALYSIS_DELAY=10              # Delay between analysis (seconds) to avoid API rate limit
-REPORT_TYPE=full               # Report type: simple/full
+REPORT_TYPE=full               # Report type: simple/mobile, brief/ultra-summary, full/complete
 SINGLE_STOCK_NOTIFY=true       # Push immediately after each stock analysis
 
 # === Schedule ===

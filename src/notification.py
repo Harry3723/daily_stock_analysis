@@ -15,6 +15,7 @@ A股自选股智能分析系统 - 通知层
    - Pushover（手机/桌面推送）
 """
 import logging
+import re
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
 from enum import Enum
@@ -242,11 +243,13 @@ class NotificationService(
         report_type: Any,
         report_date: Optional[str] = None,
     ) -> str:
-        """Generate the aggregate report content used by merge/save/push paths."""
+        """Generate aggregate report content for save/push paths."""
         normalized_type = self._normalize_report_type(report_type)
+        if normalized_type == ReportType.FULL:
+            return self.generate_dashboard_report(results, report_date=report_date)
         if normalized_type == ReportType.BRIEF:
             return self.generate_brief_report(results, report_date=report_date)
-        return self.generate_dashboard_report(results, report_date=report_date)
+        return self.generate_mobile_report(results, report_date=report_date)
 
     def _collect_models_used(self, results: List[AnalysisResult]) -> List[str]:
         models: List[str] = []
@@ -255,6 +258,304 @@ class NotificationService(
             if model:
                 models.append(model)
         return list(dict.fromkeys(models))
+
+    @staticmethod
+    def _normalize_inline_text(value: Any) -> str:
+        """Normalize free-form text into a compact single-line string."""
+        if value is None:
+            return ""
+        if not isinstance(value, str):
+            value = str(value)
+        return " ".join(value.strip().split())
+
+    @classmethod
+    def _truncate_inline_text(cls, value: Any, limit: int) -> str:
+        """Truncate text for mobile surfaces."""
+        text = cls._normalize_inline_text(value)
+        if not text or len(text) <= limit:
+            return text
+        return text[: max(1, limit - 1)].rstrip() + "…"
+
+    @classmethod
+    def _compact_mobile_text(
+        cls,
+        value: Any,
+        report_language: str,
+        *,
+        body_limit: int = 34,
+        citation_limit: int = 28,
+        fallback_limit: int = 72,
+    ) -> str:
+        """Compact evidence-rich text while preserving one short citation marker."""
+        text = cls._normalize_inline_text(value)
+        if not text:
+            return ""
+
+        if report_language == "en" and "[Source:" in text:
+            body, _, source_tail = text.partition("[Source:")
+            source_text = source_tail.rstrip(" ]")
+            source_text = re.sub(r"https?://\S+", "", source_text).strip(" |;")
+            body = cls._truncate_inline_text(body, body_limit)
+            source_text = cls._truncate_inline_text(source_text, citation_limit)
+            if source_text:
+                return f"{body} [Source: {source_text}]".strip()
+            return body
+
+        for marker in ("【依据：", "【来源："):
+            if marker in text and text.endswith("】"):
+                body, _, citation = text.partition(marker)
+                citation = citation[:-1] if citation.endswith("】") else citation
+                citation = re.sub(r"https?://\S+", "", citation).strip(" |；;")
+                body = cls._truncate_inline_text(body, body_limit)
+                citation = cls._truncate_inline_text(citation, citation_limit)
+                if citation:
+                    return f"{body}{marker}{citation}】".strip()
+                return body
+
+        return cls._truncate_inline_text(text, fallback_limit)
+
+    def _build_compact_price_line(self, result: AnalysisResult, report_language: str) -> str:
+        """Build a compact price snapshot line for mobile notifications."""
+        price = getattr(result, "current_price", None)
+        change_pct = getattr(result, "change_pct", None)
+        snapshot = getattr(result, "market_snapshot", None) or {}
+        if price is None and isinstance(snapshot, dict):
+            price = snapshot.get("close")
+        if change_pct is None and isinstance(snapshot, dict):
+            change_pct = snapshot.get("change_pct")
+
+        price_text = self._normalize_inline_text(price)
+        change_text = self._normalize_inline_text(change_pct)
+        if not price_text and not change_text:
+            return ""
+
+        if report_language == "en":
+            price_label = "Price"
+            change_label = "Change"
+        else:
+            price_label = "价格"
+            change_label = "涨跌"
+
+        parts = []
+        if price_text:
+            parts.append(f"{price_label} {price_text}")
+        if change_text:
+            if not change_text.endswith("%"):
+                change_text = f"{change_text}%"
+            parts.append(f"{change_label} {change_text}")
+        return f"- {' | '.join(parts)}"
+
+    def _build_mobile_action_line(
+        self,
+        battle: Dict[str, Any],
+        report_language: str,
+    ) -> str:
+        """Build one compact action-level line."""
+        if not isinstance(battle, dict):
+            return ""
+        sniper = battle.get("sniper_points", {})
+        if not isinstance(sniper, dict):
+            return ""
+
+        parts = []
+        ideal_buy = self._clean_sniper_value(sniper.get("ideal_buy"))
+        stop_loss = self._clean_sniper_value(sniper.get("stop_loss"))
+        take_profit = self._clean_sniper_value(sniper.get("take_profit"))
+        if ideal_buy and ideal_buy != "N/A":
+            parts.append(f"🎯 {self._truncate_inline_text(ideal_buy, 18)}")
+        if stop_loss and stop_loss != "N/A":
+            parts.append(f"🛑 {self._truncate_inline_text(stop_loss, 16)}")
+        if take_profit and take_profit != "N/A":
+            parts.append(f"🎊 {self._truncate_inline_text(take_profit, 18)}")
+        if not parts:
+            return ""
+
+        prefix = "Levels" if report_language == "en" else "点位"
+        return f"- {prefix}：{' | '.join(parts)}"
+
+    def _build_mobile_position_line(
+        self,
+        core: Dict[str, Any],
+        report_language: str,
+    ) -> str:
+        """Build one compact position-strategy line for single-stock pushes."""
+        if not isinstance(core, dict):
+            return ""
+        position = core.get("position_advice", {})
+        if not isinstance(position, dict) or not position:
+            return ""
+
+        no_position = self._compact_mobile_text(
+            position.get("no_position"),
+            report_language,
+            body_limit=20,
+            citation_limit=20,
+            fallback_limit=38,
+        )
+        has_position = self._compact_mobile_text(
+            position.get("has_position"),
+            report_language,
+            body_limit=20,
+            citation_limit=20,
+            fallback_limit=38,
+        )
+        if not no_position and not has_position:
+            return ""
+
+        if report_language == "en":
+            left = f"Flat {no_position}" if no_position else ""
+            right = f"Holding {has_position}" if has_position else ""
+            prefix = "Plan"
+        else:
+            left = f"空仓 {no_position}" if no_position else ""
+            right = f"持仓 {has_position}" if has_position else ""
+            prefix = "策略"
+
+        parts = [part for part in (left, right) if part]
+        return f"- {prefix}：{' | '.join(parts)}"
+
+    def _build_mobile_intel_lines(
+        self,
+        intel: Dict[str, Any],
+        report_language: str,
+        *,
+        max_lines: int = 3,
+    ) -> List[str]:
+        """Build compact intelligence lines for mobile reading."""
+        if not isinstance(intel, dict):
+            return []
+
+        risk_alerts = intel.get("risk_alerts", [])
+        if not isinstance(risk_alerts, list):
+            risk_alerts = [risk_alerts] if risk_alerts else []
+
+        catalysts = intel.get("positive_catalysts", [])
+        if not isinstance(catalysts, list):
+            catalysts = [catalysts] if catalysts else []
+
+        candidates = [
+            ("🚨", risk_alerts[0] if risk_alerts else ""),
+            ("📊", intel.get("earnings_outlook")),
+            ("💭", intel.get("sentiment_summary")),
+            ("📰", intel.get("latest_news")),
+            ("✨", catalysts[0] if catalysts else ""),
+        ]
+
+        lines: List[str] = []
+        seen: set[str] = set()
+        for emoji, raw_text in candidates:
+            compact = self._compact_mobile_text(
+                raw_text,
+                report_language,
+                body_limit=32,
+                citation_limit=26,
+                fallback_limit=64,
+            )
+            if not compact or compact in seen:
+                continue
+            seen.add(compact)
+            lines.append(f"- {emoji} {compact}")
+            if len(lines) >= max_lines:
+                break
+        return lines
+
+    def _build_mobile_stock_body(
+        self,
+        result: AnalysisResult,
+        report_language: str,
+        *,
+        include_position_line: bool = False,
+        max_intel_lines: int = 3,
+    ) -> List[str]:
+        """Build compact stock body lines shared by simple/brief/mobile pushes."""
+        dashboard = result.dashboard if hasattr(result, "dashboard") and result.dashboard else {}
+        core = dashboard.get("core_conclusion", {}) if isinstance(dashboard, dict) else {}
+        battle = dashboard.get("battle_plan", {}) if isinstance(dashboard, dict) else {}
+        intel = dashboard.get("intelligence", {}) if isinstance(dashboard, dict) else {}
+
+        body: List[str] = []
+        conclusion = core.get("one_sentence", result.analysis_summary) if core else result.analysis_summary
+        compact_conclusion = self._compact_mobile_text(
+            conclusion,
+            report_language,
+            body_limit=36,
+            citation_limit=28,
+            fallback_limit=72,
+        )
+        if compact_conclusion:
+            prefix = "Call" if report_language == "en" else "结论"
+            body.append(f"- {prefix}：{compact_conclusion}")
+
+        price_line = self._build_compact_price_line(result, report_language)
+        if price_line:
+            body.append(price_line)
+
+        body.extend(
+            self._build_mobile_intel_lines(
+                intel,
+                report_language,
+                max_lines=max_intel_lines,
+            )
+        )
+
+        action_line = self._build_mobile_action_line(battle, report_language)
+        if action_line:
+            body.append(action_line)
+
+        if include_position_line:
+            position_line = self._build_mobile_position_line(core, report_language)
+            if position_line:
+                body.append(position_line)
+
+        return body
+
+    def generate_mobile_report(
+        self,
+        results: List[AnalysisResult],
+        report_date: Optional[str] = None,
+    ) -> str:
+        """Generate compact, citation-preserving report blocks for mobile pushes."""
+        if report_date is None:
+            report_date = datetime.now().strftime('%Y-%m-%d')
+        report_language = self._get_report_language(results)
+        labels = get_report_labels(report_language)
+        if not results:
+            return f"# {report_date} {labels['brief_title']}\n\n{labels['no_results']}"
+
+        sorted_results = sorted(results, key=lambda x: x.sentiment_score, reverse=True)
+        buy_count = sum(1 for r in results if getattr(r, 'decision_type', '') == 'buy')
+        sell_count = sum(1 for r in results if getattr(r, 'decision_type', '') == 'sell')
+        hold_count = sum(1 for r in results if getattr(r, 'decision_type', '') in ('hold', ''))
+        lines = [
+            f"# {report_date} {labels['brief_title']}",
+            "",
+            f"> {len(results)} {labels['stock_unit_compact']} | 🟢{buy_count} 🟡{hold_count} 🔴{sell_count}",
+            "",
+        ]
+
+        for result in sorted_results:
+            _, emoji, _ = self._get_signal_level(result)
+            name = self._get_display_name(result, report_language)
+            lines.append(
+                f"## {emoji} {name}({result.code}) | "
+                f"{localize_operation_advice(result.operation_advice, report_language)} | "
+                f"{labels['score_label']} {result.sentiment_score}"
+            )
+            lines.extend(
+                self._build_mobile_stock_body(
+                    result,
+                    report_language,
+                    include_position_line=False,
+                    max_intel_lines=3,
+                )
+            )
+            lines.append("")
+
+        models = self._collect_models_used(results)
+        if models:
+            lines.append(f"*{labels['analysis_model_label']}: {', '.join(models)}*")
+        lines.append(f"*{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*")
+        return "\n".join(lines).rstrip()
     
     def _detect_all_channels(self) -> List[NotificationChannel]:
         """
@@ -1355,7 +1656,13 @@ class NotificationService(
             name = self._get_display_name(r, report_language)
             dash = r.dashboard or {}
             core = dash.get('core_conclusion', {}) or {}
-            one = (core.get('one_sentence') or r.analysis_summary or '')[:60]
+            one = self._compact_mobile_text(
+                core.get('one_sentence') or r.analysis_summary or '',
+                report_language,
+                body_limit=24,
+                citation_limit=22,
+                fallback_limit=60,
+            )
             lines.append(
                 f"**{name}({r.code})** {emoji} "
                 f"{localize_operation_advice(r.operation_advice, report_language)} | "
@@ -1380,11 +1687,9 @@ class NotificationService(
         report_date = datetime.now().strftime('%Y-%m-%d %H:%M')
         report_language = self._get_report_language(result)
         labels = get_report_labels(report_language)
-        signal_text, signal_emoji, _ = self._get_signal_level(result)
+        _, signal_emoji, _ = self._get_signal_level(result)
         dashboard = result.dashboard if hasattr(result, 'dashboard') and result.dashboard else {}
         core = dashboard.get('core_conclusion', {}) if dashboard else {}
-        battle = dashboard.get('battle_plan', {}) if dashboard else {}
-        intel = dashboard.get('intelligence', {}) if dashboard else {}
         
         # 股票名称（转义 *ST 等特殊字符）
         stock_name = self._get_display_name(result, report_language)
@@ -1392,87 +1697,21 @@ class NotificationService(
         lines = [
             f"## {signal_emoji} {stock_name} ({result.code})",
             "",
-            f"> {report_date} | {labels['score_label']}: **{result.sentiment_score}** | {localize_trend_prediction(result.trend_prediction, report_language)}",
+            f"> {report_date} | {labels['score_label']}: **{result.sentiment_score}** | "
+            f"{localize_operation_advice(result.operation_advice, report_language)} | "
+            f"{localize_trend_prediction(result.trend_prediction, report_language)}",
             "",
         ]
 
-        self._append_market_snapshot(lines, result)
-        
-        # 核心决策（一句话）
-        one_sentence = core.get('one_sentence', result.analysis_summary) if core else result.analysis_summary
-        if one_sentence:
-            lines.extend([
-                f"### 📌 {labels['core_conclusion_heading']}",
-                "",
-                f"**{signal_text}**: {one_sentence}",
-                "",
-            ])
-        
-        # 重要信息（舆情+基本面）
-        info_added = False
-        if intel:
-            if intel.get('earnings_outlook'):
-                if not info_added:
-                    lines.append(f"### 📰 {labels['info_heading']}")
-                    lines.append("")
-                    info_added = True
-                lines.append(f"📊 **{labels['earnings_outlook_label']}**: {str(intel['earnings_outlook'])[:100]}")
-            
-            if intel.get('sentiment_summary'):
-                if not info_added:
-                    lines.append(f"### 📰 {labels['info_heading']}")
-                    lines.append("")
-                    info_added = True
-                lines.append(f"💭 **{labels['sentiment_summary_label']}**: {str(intel['sentiment_summary'])[:80]}")
-            
-            # 风险警报
-            risks = intel.get('risk_alerts', [])
-            if risks:
-                if not info_added:
-                    lines.append(f"### 📰 {labels['info_heading']}")
-                    lines.append("")
-                    info_added = True
-                lines.append("")
-                lines.append(f"🚨 **{labels['risk_alerts_label']}**:")
-                for risk in risks[:3]:
-                    lines.append(f"- {str(risk)[:60]}")
-            
-            # 利好催化
-            catalysts = intel.get('positive_catalysts', [])
-            if catalysts:
-                lines.append("")
-                lines.append(f"✨ **{labels['positive_catalysts_label']}**:")
-                for cat in catalysts[:3]:
-                    lines.append(f"- {str(cat)[:60]}")
-        
-        if info_added:
+        body_lines = self._build_mobile_stock_body(
+            result,
+            report_language,
+            include_position_line=True,
+            max_intel_lines=4,
+        )
+        if body_lines:
+            lines.extend(body_lines)
             lines.append("")
-        
-        # 狙击点位
-        sniper = battle.get('sniper_points', {}) if battle else {}
-        if sniper:
-            lines.extend([
-                f"### 🎯 {labels['action_points_heading']}",
-                "",
-                f"| {labels['ideal_buy_label']} | {labels['stop_loss_label']} | {labels['take_profit_label']} |",
-                "|------|------|------|",
-            ])
-            ideal_buy = sniper.get('ideal_buy', '-')
-            stop_loss = sniper.get('stop_loss', '-')
-            take_profit = sniper.get('take_profit', '-')
-            lines.append(f"| {ideal_buy} | {stop_loss} | {take_profit} |")
-            lines.append("")
-        
-        # 持仓建议
-        pos_advice = core.get('position_advice', {}) if core else {}
-        if pos_advice:
-            lines.extend([
-                f"### 💼 {labels['position_advice_heading']}",
-                "",
-                f"- 🆕 **{labels['no_position_label']}**: {pos_advice.get('no_position', localize_operation_advice(result.operation_advice, report_language))}",
-                f"- 💼 **{labels['has_position_label']}**: {pos_advice.get('has_position', labels['continue_holding'])}",
-                "",
-            ])
         
         lines.append("---")
         model_used = normalize_model_used(getattr(result, "model_used", None))

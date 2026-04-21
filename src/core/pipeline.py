@@ -375,6 +375,7 @@ class StockAnalysisPipeline:
 
             # Step 4: 多维度情报搜索（最新消息+风险排查+业绩预期）
             news_context = None
+            intel_results: Dict[str, Any] = {}
             self._emit_progress(46, f"{stock_name}：正在检索新闻与舆情")
             if self.search_service is not None and self.search_service.is_available:
                 logger.info(f"{stock_name}({code}) 开始多维度情报搜索...")
@@ -490,6 +491,12 @@ class StockAnalysisPipeline:
             # Step 7.7: price_position fallback
             if result:
                 fill_price_position_if_needed(result, trend_result, realtime_quote)
+                self._backfill_result_evidence(
+                    result=result,
+                    intel_results=intel_results,
+                    fundamental_context=fundamental_context,
+                    stock_name=stock_name,
+                )
 
             # Step 8: 保存分析历史记录
             if result and result.success:
@@ -736,6 +743,659 @@ class StockAnalysisPipeline:
         enriched_context["belong_boards"] = boards
         return enriched_context
 
+    @staticmethod
+    def _normalize_free_text(value: Any) -> str:
+        """Normalize free-form text to a single-line string."""
+        if value is None:
+            return ""
+        if not isinstance(value, str):
+            value = str(value)
+        return " ".join(value.strip().split())
+
+    @staticmethod
+    def _shorten_text(value: Any, limit: int = 40) -> str:
+        """Shorten a text snippet for compact summaries."""
+        text = StockAnalysisPipeline._normalize_free_text(value)
+        if not text or len(text) <= limit:
+            return text
+        return text[: max(1, limit - 1)].rstrip() + "…"
+
+    @staticmethod
+    def _search_item_value(item: Any, field: str) -> Any:
+        """Read SearchResult-like values from either dicts or objects."""
+        if isinstance(item, dict):
+            return item.get(field)
+        return getattr(item, field, None)
+
+    @classmethod
+    def _search_item_text(cls, item: Any) -> str:
+        """Combine title/snippet into a keyword-analysis text block."""
+        title = cls._normalize_free_text(cls._search_item_value(item, "title"))
+        snippet = cls._normalize_free_text(
+            cls._search_item_value(item, "snippet")
+            or cls._search_item_value(item, "content")
+        )
+        return f"{title} {snippet}".strip()
+
+    @staticmethod
+    def _has_evidence_marker(text: Any) -> bool:
+        """Return True when the text already embeds an explicit citation marker."""
+        normalized = StockAnalysisPipeline._normalize_free_text(text)
+        if not normalized:
+            return False
+        return any(
+            marker in normalized
+            for marker in ("【依据：", "【来源：", "[Source:", "http://", "https://")
+        )
+
+    @staticmethod
+    def _is_placeholder_text(text: Any) -> bool:
+        """Detect generic placeholder-like prose that should be replaced."""
+        normalized = StockAnalysisPipeline._normalize_free_text(text)
+        if not normalized:
+            return True
+
+        exact_placeholders = {
+            "新闻摘要",
+            "市场情绪",
+            "热点话题",
+            "技术面数据",
+            "分析完成",
+            "Analysis completed",
+            "Technical data",
+        }
+        if normalized in exact_placeholders:
+            return True
+
+        placeholder_fragments = (
+            "近期重要新闻摘要",
+            "最新消息",
+            "舆情情绪一句话总结",
+            "业绩预期分析",
+            "数据来源说明",
+            "Recent news summary",
+            "Latest news summary",
+            "Sentiment summary",
+            "Earnings outlook",
+            "Data source summary",
+        )
+        return any(fragment in normalized for fragment in placeholder_fragments)
+
+    @staticmethod
+    def _append_evidence(text: str, evidence: str, report_language: str) -> str:
+        """Append a compact evidence marker to free-form text."""
+        base = StockAnalysisPipeline._normalize_free_text(text)
+        proof = StockAnalysisPipeline._normalize_free_text(evidence)
+        if not base:
+            return ""
+        if not proof or StockAnalysisPipeline._has_evidence_marker(base):
+            return base
+        if report_language == "en":
+            return f"{base} [Source: {proof}]"
+        return f"{base}【依据：{proof}】"
+
+    @classmethod
+    def _format_citation_item(cls, item: Any) -> str:
+        """Format one search item into a human-readable citation."""
+        title = cls._normalize_free_text(cls._search_item_value(item, "title"))
+        if not title:
+            return ""
+        source = cls._normalize_free_text(cls._search_item_value(item, "source")) or "来源未明"
+        published_date = cls._normalize_free_text(
+            cls._search_item_value(item, "published_date")
+        ) or "日期未明"
+        return f"{published_date} {source}《{title}》"
+
+    @classmethod
+    def _collect_search_items(
+        cls,
+        intel_results: Optional[Dict[str, Any]],
+        dimensions: List[str],
+        limit: int = 3,
+    ) -> List[Any]:
+        """Collect search items across dimensions while preserving dimension order."""
+        if not isinstance(intel_results, dict):
+            return []
+
+        collected: List[Any] = []
+        seen: set[Tuple[str, str]] = set()
+        for dimension in dimensions:
+            response = intel_results.get(dimension)
+            if not response or not getattr(response, "success", False):
+                continue
+            for item in getattr(response, "results", []) or []:
+                title = cls._normalize_free_text(cls._search_item_value(item, "title"))
+                url = cls._normalize_free_text(cls._search_item_value(item, "url"))
+                identity = (title, url)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                collected.append(item)
+                if len(collected) >= limit:
+                    return collected
+        return collected
+
+    @classmethod
+    def _build_response_citation(
+        cls,
+        intel_results: Optional[Dict[str, Any]],
+        dimensions: List[str],
+        limit: int = 2,
+    ) -> str:
+        """Build a compact citation string from multiple search dimensions."""
+        citations: List[str] = []
+        for item in cls._collect_search_items(intel_results, dimensions, limit=limit):
+            citation = cls._format_citation_item(item)
+            if citation and citation not in citations:
+                citations.append(citation)
+        return "；".join(citations[:limit])
+
+    @classmethod
+    def _is_negative_signal_text(cls, text: str) -> bool:
+        """Heuristic detection of risk-oriented news wording."""
+        lowered = text.lower()
+        negative_keywords = (
+            "减持",
+            "处罚",
+            "诉讼",
+            "风险",
+            "问询",
+            "调查",
+            "违规",
+            "预减",
+            "亏损",
+            "下滑",
+            "拖累",
+            "违约",
+            "downgrade",
+            "lawsuit",
+            "probe",
+            "miss",
+            "warning",
+            "weak",
+            "drop",
+        )
+        return any(keyword in lowered for keyword in negative_keywords)
+
+    @classmethod
+    def _is_positive_signal_text(cls, text: str) -> bool:
+        """Heuristic detection of positive catalyst wording."""
+        lowered = text.lower()
+        positive_keywords = (
+            "预增",
+            "增长",
+            "中标",
+            "签约",
+            "合作",
+            "回购",
+            "增持",
+            "上调",
+            "扭亏",
+            "突破",
+            "新高",
+            "beat",
+            "upgrade",
+            "contract",
+            "partnership",
+            "buyback",
+            "surge",
+            "growth",
+        )
+        return any(keyword in lowered for keyword in positive_keywords)
+
+    def _build_news_digest(
+        self,
+        intel_results: Optional[Dict[str, Any]],
+        report_language: str,
+    ) -> str:
+        """Build a concise summary of verifiable recent developments."""
+        items = self._collect_search_items(
+            intel_results,
+            ["latest_news", "announcements"],
+            limit=2,
+        )
+        titles = [
+            self._shorten_text(self._search_item_value(item, "title"), limit=44)
+            for item in items
+            if self._search_item_value(item, "title")
+        ]
+        titles = [title for title in titles if title]
+        if not titles:
+            return ""
+        if report_language == "en":
+            return f"Verifiable recent developments focus on: {'; '.join(titles)}."
+        return f"近期可验证消息集中在：{'；'.join(titles)}。"
+
+    def _extract_fundamental_earnings_payload(
+        self,
+        fundamental_context: Optional[Dict[str, Any]],
+    ) -> Tuple[Dict[str, Any], List[str]]:
+        """Extract earnings-related structured fundamentals and source labels."""
+        if not isinstance(fundamental_context, dict):
+            return {}, []
+
+        earnings_block = fundamental_context.get("earnings", {})
+        earnings_data = earnings_block.get("data", {}) if isinstance(earnings_block, dict) else {}
+        if not isinstance(earnings_data, dict):
+            earnings_data = {}
+
+        source_labels: List[str] = []
+        raw_chain = fundamental_context.get("source_chain", [])
+        if isinstance(raw_chain, (list, tuple)):
+            for item in raw_chain:
+                if isinstance(item, dict):
+                    provider = self._normalize_free_text(item.get("provider"))
+                    result = self._normalize_free_text(item.get("result"))
+                    label = ":".join(part for part in (provider, result) if part)
+                else:
+                    label = self._normalize_free_text(item)
+                if not label:
+                    continue
+                lowered = label.lower()
+                if any(keyword in lowered for keyword in ("earnings", "forecast", "quick", "dividend", "growth")):
+                    if label not in source_labels:
+                        source_labels.append(label)
+
+        return earnings_data, source_labels[:4]
+
+    def _build_fundamental_earnings_summary(
+        self,
+        fundamental_context: Optional[Dict[str, Any]],
+        report_language: str,
+    ) -> Tuple[str, str]:
+        """Build an earnings-oriented fallback summary from structured fundamentals."""
+        earnings_data, source_labels = self._extract_fundamental_earnings_payload(fundamental_context)
+        if not earnings_data:
+            return "", ""
+
+        for field in ("forecast_summary", "quick_report_summary"):
+            candidate = self._normalize_free_text(earnings_data.get(field))
+            if candidate:
+                return candidate, "；".join(source_labels)
+
+        financial_report = earnings_data.get("financial_report", {})
+        if not isinstance(financial_report, dict):
+            financial_report = {}
+        report_date = self._normalize_free_text(financial_report.get("report_date"))
+        revenue = self._normalize_free_text(financial_report.get("revenue"))
+        net_profit = self._normalize_free_text(financial_report.get("net_profit_parent"))
+
+        if report_date or revenue or net_profit:
+            if report_language == "en":
+                summary = (
+                    f"Structured fundamentals show the latest report period {report_date or 'unknown'}, "
+                    f"revenue {revenue or 'N/A'}, and parent net profit {net_profit or 'N/A'}."
+                )
+            else:
+                summary = (
+                    f"结构化基本面显示最近报告期为{report_date or '未知'}，"
+                    f"营业收入{revenue or 'N/A'}，归母净利润{net_profit or 'N/A'}。"
+                )
+            return summary, "；".join(source_labels)
+
+        return "", "；".join(source_labels)
+
+    def _build_default_market_sentiment(
+        self,
+        intel_results: Optional[Dict[str, Any]],
+        report_language: str,
+    ) -> str:
+        """Derive a conservative sentiment label from cited search items."""
+        items = self._collect_search_items(
+            intel_results,
+            ["risk_check", "earnings", "announcements", "market_analysis", "latest_news"],
+            limit=6,
+        )
+        if not items:
+            return ""
+
+        positive_count = 0
+        negative_count = 0
+        for item in items:
+            text = self._search_item_text(item)
+            if self._is_positive_signal_text(text):
+                positive_count += 1
+            if self._is_negative_signal_text(text):
+                negative_count += 1
+
+        if report_language == "en":
+            if negative_count >= positive_count + 2:
+                return (
+                    f"Market sentiment is cautious because recent verifiable items show "
+                    f"{negative_count} risk cues versus {positive_count} positive cues."
+                )
+            if positive_count >= negative_count + 2:
+                return (
+                    f"Market sentiment is constructive because recent verifiable items show "
+                    f"{positive_count} positive cues versus {negative_count} risk cues."
+                )
+            return (
+                f"Market sentiment is neutral because recent verifiable items show "
+                f"{positive_count} positive cues and {negative_count} risk cues, without a clear one-sided bias."
+            )
+
+        if negative_count >= positive_count + 2:
+            return (
+                f"市场情绪偏谨慎，依据近期可验证信息中风险线索{negative_count}条、"
+                f"正向线索{positive_count}条，负面因素占优。"
+            )
+        if positive_count >= negative_count + 2:
+            return (
+                f"市场情绪偏积极，依据近期可验证信息中正向线索{positive_count}条、"
+                f"风险线索{negative_count}条，催化因素略占优。"
+            )
+        return (
+            f"市场情绪中性，依据近期可验证信息中正向线索{positive_count}条、"
+            f"风险线索{negative_count}条，暂未形成明显单边预期。"
+        )
+
+    def _ground_qualitative_text(
+        self,
+        current_text: Any,
+        evidence: str,
+        *,
+        report_language: str,
+        missing_note: str,
+        default_text: str = "",
+    ) -> str:
+        """Ensure qualitative text either cites evidence or explicitly records missing data."""
+        base_text = self._normalize_free_text(current_text)
+        if base_text and self._has_evidence_marker(base_text):
+            return base_text
+
+        chosen_text = base_text
+        if not chosen_text or self._is_placeholder_text(chosen_text):
+            chosen_text = self._normalize_free_text(default_text)
+
+        if not evidence or not chosen_text:
+            return missing_note
+
+        return self._append_evidence(chosen_text, evidence, report_language)
+
+    @staticmethod
+    def _is_generic_data_sources(text: Any) -> bool:
+        """Detect placeholder-like data_sources strings."""
+        normalized = StockAnalysisPipeline._normalize_free_text(text)
+        if not normalized:
+            return True
+        return normalized in {"技术面数据", "Technical data"} or normalized.startswith("agent:")
+
+    def _backfill_result_evidence(
+        self,
+        result: Optional[AnalysisResult],
+        *,
+        intel_results: Optional[Dict[str, Any]],
+        fundamental_context: Optional[Dict[str, Any]],
+        stock_name: str,
+    ) -> None:
+        """Backfill missing qualitative fields with explicit evidence or missing notes."""
+        if result is None:
+            return
+
+        report_language = normalize_report_language(
+            getattr(result, "report_language", None) or getattr(self.config, "report_language", "zh")
+        )
+
+        dashboard = result.dashboard if isinstance(result.dashboard, dict) else {}
+        result.dashboard = dashboard
+        intelligence = dashboard.get("intelligence")
+        if not isinstance(intelligence, dict):
+            intelligence = {}
+            dashboard["intelligence"] = intelligence
+        core_conclusion = dashboard.get("core_conclusion")
+        if not isinstance(core_conclusion, dict):
+            core_conclusion = {}
+            dashboard["core_conclusion"] = core_conclusion
+
+        latest_citation = self._build_response_citation(
+            intel_results,
+            ["latest_news", "announcements"],
+            limit=2,
+        )
+        earnings_citation = self._build_response_citation(
+            intel_results,
+            ["earnings", "announcements", "market_analysis"],
+            limit=2,
+        )
+        market_citation = self._build_response_citation(
+            intel_results,
+            ["risk_check", "earnings", "market_analysis", "latest_news", "announcements"],
+            limit=3,
+        )
+        overall_citation = self._build_response_citation(
+            intel_results,
+            ["latest_news", "announcements", "earnings", "market_analysis", "risk_check"],
+            limit=3,
+        )
+
+        latest_summary = self._build_news_digest(intel_results, report_language)
+        fundamental_earnings_summary, fundamental_earnings_citation = self._build_fundamental_earnings_summary(
+            fundamental_context,
+            report_language,
+        )
+        earnings_summary = ""
+        earnings_items = self._collect_search_items(intel_results, ["earnings"], limit=2)
+        if earnings_items:
+            titles = [
+                self._shorten_text(self._search_item_value(item, "title"), limit=44)
+                for item in earnings_items
+                if self._search_item_value(item, "title")
+            ]
+            titles = [title for title in titles if title]
+            if titles:
+                if report_language == "en":
+                    earnings_summary = f"Recent earnings clues focus on: {'; '.join(titles)}."
+                else:
+                    earnings_summary = f"近45日业绩线索主要集中在：{'；'.join(titles)}。"
+        if not earnings_summary and fundamental_earnings_summary:
+            earnings_summary = fundamental_earnings_summary
+
+        if not earnings_citation:
+            earnings_citation = fundamental_earnings_citation
+
+        sentiment_summary = self._build_default_market_sentiment(intel_results, report_language)
+        fundamental_summary = fundamental_earnings_summary
+        overall_summary = latest_summary or earnings_summary or fundamental_summary
+
+        latest_missing_note = (
+            "Information missing: no verifiable recent news or announcement evidence was retrieved for this run."
+            if report_language == "en"
+            else "信息缺失：本次检索未获取到可核验的近期新闻或公告依据，无法给出可信消息摘要。"
+        )
+        earnings_missing_note = (
+            "Information missing: no verifiable earnings/forecast evidence was retrieved, so earnings outlook cannot be grounded."
+            if report_language == "en"
+            else "信息缺失：未获取到可核验的业绩预告/快报/财报依据，当前无法给出可信的业绩预期。"
+        )
+        sentiment_missing_note = (
+            "Information missing: recent sentiment evidence is insufficient, so market sentiment cannot be grounded."
+            if report_language == "en"
+            else "信息缺失：近期舆情与公告依据不足，当前无法给出可信的市场情绪判断。"
+        )
+        fundamental_missing_note = (
+            "Information missing: structured fundamentals are insufficient, so fundamental analysis cannot be grounded."
+            if report_language == "en"
+            else "信息缺失：结构化基本面摘要不足，当前无法给出可信的基本面判断。"
+        )
+
+        intelligence["latest_news"] = self._ground_qualitative_text(
+            intelligence.get("latest_news"),
+            latest_citation,
+            report_language=report_language,
+            missing_note=latest_missing_note,
+            default_text=latest_summary,
+        )
+        intelligence["earnings_outlook"] = self._ground_qualitative_text(
+            intelligence.get("earnings_outlook"),
+            earnings_citation,
+            report_language=report_language,
+            missing_note=earnings_missing_note,
+            default_text=earnings_summary,
+        )
+        intelligence["sentiment_summary"] = self._ground_qualitative_text(
+            intelligence.get("sentiment_summary"),
+            market_citation,
+            report_language=report_language,
+            missing_note=sentiment_missing_note,
+            default_text=sentiment_summary,
+        )
+
+        risk_citation = self._build_response_citation(intel_results, ["risk_check"], limit=1)
+        risk_items = self._collect_search_items(intel_results, ["risk_check"], limit=2)
+        raw_risk_alerts = intelligence.get("risk_alerts", [])
+        if not isinstance(raw_risk_alerts, list):
+            raw_risk_alerts = [raw_risk_alerts] if raw_risk_alerts else []
+        if raw_risk_alerts:
+            grounded_risks = []
+            for item in raw_risk_alerts:
+                grounded_risks.append(
+                    self._ground_qualitative_text(
+                        item,
+                        risk_citation,
+                        report_language=report_language,
+                        missing_note=sentiment_missing_note,
+                    )
+                )
+            intelligence["risk_alerts"] = grounded_risks
+        elif risk_items:
+            intelligence["risk_alerts"] = [
+                self._append_evidence(
+                    self._shorten_text(self._search_item_value(item, "title"), limit=56),
+                    self._format_citation_item(item),
+                    report_language,
+                )
+                for item in risk_items
+                if self._search_item_value(item, "title")
+            ]
+
+        catalyst_items = []
+        for item in self._collect_search_items(
+            intel_results,
+            ["earnings", "announcements", "market_analysis", "latest_news"],
+            limit=5,
+        ):
+            if self._is_positive_signal_text(self._search_item_text(item)):
+                catalyst_items.append(item)
+            if len(catalyst_items) >= 2:
+                break
+        catalyst_citation = self._build_response_citation(
+            intel_results,
+            ["earnings", "announcements", "market_analysis", "latest_news"],
+            limit=2,
+        )
+        raw_catalysts = intelligence.get("positive_catalysts", [])
+        if not isinstance(raw_catalysts, list):
+            raw_catalysts = [raw_catalysts] if raw_catalysts else []
+        if raw_catalysts:
+            grounded_catalysts = []
+            for item in raw_catalysts:
+                grounded_catalysts.append(
+                    self._ground_qualitative_text(
+                        item,
+                        catalyst_citation,
+                        report_language=report_language,
+                        missing_note=latest_missing_note,
+                    )
+                )
+            intelligence["positive_catalysts"] = grounded_catalysts
+        elif catalyst_items:
+            intelligence["positive_catalysts"] = [
+                self._append_evidence(
+                    self._shorten_text(self._search_item_value(item, "title"), limit=56),
+                    self._format_citation_item(item),
+                    report_language,
+                )
+                for item in catalyst_items
+                if self._search_item_value(item, "title")
+            ]
+
+        result.news_summary = self._ground_qualitative_text(
+            result.news_summary,
+            latest_citation,
+            report_language=report_language,
+            missing_note=latest_missing_note,
+            default_text=latest_summary,
+        )
+        result.market_sentiment = self._ground_qualitative_text(
+            result.market_sentiment,
+            market_citation,
+            report_language=report_language,
+            missing_note=sentiment_missing_note,
+            default_text=sentiment_summary,
+        )
+        result.fundamental_analysis = self._ground_qualitative_text(
+            result.fundamental_analysis,
+            earnings_citation,
+            report_language=report_language,
+            missing_note=fundamental_missing_note,
+            default_text=fundamental_summary,
+        )
+        result.analysis_summary = self._ground_qualitative_text(
+            result.analysis_summary,
+            overall_citation or earnings_citation,
+            report_language=report_language,
+            missing_note=(
+                "Information missing: no verifiable qualitative evidence was retrieved for this run."
+                if report_language == "en"
+                else "信息缺失：本次未获取到足够的可核验定性依据，综合结论仅能保留为空缺记录。"
+            ),
+            default_text=overall_summary or result.analysis_summary,
+        )
+
+        one_sentence = self._normalize_free_text(core_conclusion.get("one_sentence"))
+        if one_sentence and not self._has_evidence_marker(one_sentence) and (overall_citation or earnings_citation):
+            core_conclusion["one_sentence"] = self._append_evidence(
+                one_sentence,
+                overall_citation or earnings_citation,
+                report_language,
+            )
+
+        source_bits: List[str] = []
+        existing_sources = self._normalize_free_text(result.data_sources)
+        if existing_sources and not self._is_generic_data_sources(existing_sources):
+            source_bits.append(existing_sources)
+
+        search_provider_bits: List[str] = []
+        if isinstance(intel_results, dict):
+            for dimension, response in intel_results.items():
+                if not response or not getattr(response, "success", False):
+                    continue
+                provider = getattr(response, "provider", "")
+                if isinstance(provider, str) and provider.strip():
+                    search_provider_bits.append(f"{dimension}={provider.strip()}")
+
+        _, fundamental_source_labels = self._extract_fundamental_earnings_payload(fundamental_context)
+        if search_provider_bits:
+            if report_language == "en":
+                source_bits.append(f"search providers: {', '.join(search_provider_bits)}")
+            else:
+                source_bits.append(f"搜索来源：{'、'.join(search_provider_bits)}")
+        if fundamental_source_labels:
+            if report_language == "en":
+                source_bits.append(f"fundamentals: {', '.join(fundamental_source_labels)}")
+            else:
+                source_bits.append(f"基本面来源：{'、'.join(fundamental_source_labels)}")
+        if overall_citation:
+            if report_language == "en":
+                source_bits.append(f"cited items: {overall_citation}")
+            else:
+                source_bits.append(f"引用条目：{overall_citation}")
+
+        if source_bits:
+            if report_language == "en":
+                result.data_sources = "; ".join(source_bits)
+            else:
+                result.data_sources = "；".join(source_bits)
+        elif self._is_generic_data_sources(existing_sources):
+            result.data_sources = (
+                "Information missing: no verifiable search/fundamental source chain was retained for this run."
+                if report_language == "en"
+                else "信息缺失：本次运行未保留可核验的搜索或基本面来源链路。"
+            )
+
+        if isinstance(intel_results, dict) and intel_results:
+            result.search_performed = True
+
     def _analyze_with_agent(
         self, 
         code: str, 
@@ -820,6 +1480,7 @@ class StockAnalysisPipeline:
                 fill_price_position_if_needed(result, trend_result, realtime_quote)
 
             resolved_stock_name = result.name if result and result.name else stock_name
+            agent_intel_results: Dict[str, Any] = {}
 
             # 保存新闻情报到数据库（Agent 工具结果仅用于 LLM 上下文，未持久化，Fixes #396）
             # 使用 search_stock_news（与 Agent 工具调用逻辑一致），仅 1 次 API 调用，无额外延迟
@@ -840,9 +1501,18 @@ class StockAnalysisPipeline:
                             response=news_response,
                             query_context=query_context
                         )
+                        agent_intel_results["latest_news"] = news_response
                         logger.info(f"[{code}] Agent 模式: 新闻情报已保存 {len(news_response.results)} 条")
                 except Exception as e:
                     logger.warning(f"[{code}] Agent 模式保存新闻情报失败: {e}")
+
+            if result:
+                self._backfill_result_evidence(
+                    result=result,
+                    intel_results=agent_intel_results,
+                    fundamental_context=fundamental_context,
+                    stock_name=resolved_stock_name,
+                )
 
             # 保存分析历史记录
             if result and result.success:

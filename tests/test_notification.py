@@ -17,17 +17,63 @@ TODO:
 import os
 import sys
 import unittest
+import types
 from unittest import mock
 from typing import Optional
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+def _install_stub_module(name: str, **attrs):
+    """Register a lightweight module stub for optional runtime deps."""
+    module = types.ModuleType(name)
+    for key, value in attrs.items():
+        setattr(module, key, value)
+    sys.modules[name] = module
+    return module
+
+
 # Keep this test runnable when optional LLM/runtime deps are not installed.
-for optional_module in ("litellm", "json_repair"):
-    try:
-        __import__(optional_module)
-    except ModuleNotFoundError:
-        sys.modules[optional_module] = mock.MagicMock()
+try:
+    import dotenv  # noqa: F401
+except ModuleNotFoundError:
+    _install_stub_module(
+        "dotenv",
+        load_dotenv=lambda *args, **kwargs: None,
+        dotenv_values=lambda *args, **kwargs: {},
+    )
+
+try:
+    import litellm  # noqa: F401
+except ModuleNotFoundError:
+    _install_stub_module("litellm", Router=type("Router", (), {}))
+
+try:
+    import json_repair  # noqa: F401
+except ModuleNotFoundError:
+    _install_stub_module("json_repair", repair_json=lambda text, *args, **kwargs: text)
+
+try:
+    import markdown2  # noqa: F401
+except ModuleNotFoundError:
+    _install_stub_module("markdown2", markdown=lambda text, *args, **kwargs: text)
+
+try:
+    import src.storage  # noqa: F401
+except ModuleNotFoundError:
+    _install_stub_module("src.storage", persist_llm_usage=lambda *args, **kwargs: None)
+
+if "bot.models" not in sys.modules:
+    bot_module = sys.modules.setdefault("bot", types.ModuleType("bot"))
+    bot_models = _install_stub_module("bot.models", BotMessage=type("BotMessage", (), {}))
+    setattr(bot_module, "models", bot_models)
+
+if "data_provider.base" not in sys.modules:
+    data_provider_module = sys.modules.setdefault("data_provider", types.ModuleType("data_provider"))
+    data_provider_base = _install_stub_module(
+        "data_provider.base",
+        normalize_stock_code=lambda code: code,
+    )
+    setattr(data_provider_module, "base", data_provider_base)
 
 from src.config import Config
 from src.notification import NotificationService, NotificationChannel
@@ -191,17 +237,20 @@ class TestNotificationServiceReportGeneration(unittest.TestCase):
 
         with mock.patch.object(service, "generate_dashboard_report", return_value="dashboard") as mock_dashboard, mock.patch.object(
             service, "generate_brief_report", return_value="brief"
-        ) as mock_brief:
-            self.assertEqual(service.generate_aggregate_report([result], "simple"), "dashboard")
+        ) as mock_brief, mock.patch.object(
+            service, "generate_mobile_report", return_value="mobile"
+        ) as mock_mobile:
+            self.assertEqual(service.generate_aggregate_report([result], "simple"), "mobile")
             self.assertEqual(service.generate_aggregate_report([result], "full"), "dashboard")
             self.assertEqual(service.generate_aggregate_report([result], "detailed"), "dashboard")
             self.assertEqual(service.generate_aggregate_report([result], "brief"), "brief")
 
-        self.assertEqual(mock_dashboard.call_count, 3)
+        self.assertEqual(mock_dashboard.call_count, 2)
         mock_brief.assert_called_once()
+        mock_mobile.assert_called_once()
 
     @mock.patch("src.notification.get_config")
-    def test_generate_single_stock_report_keeps_legacy_simple_format(self, mock_get_config: mock.MagicMock):
+    def test_generate_single_stock_report_uses_compact_mobile_fallback(self, mock_get_config: mock.MagicMock):
         mock_get_config.return_value = _make_config(report_renderer_enabled=True)
         service = NotificationService()
         result = AnalysisResult(
@@ -219,6 +268,45 @@ class TestNotificationServiceReportGeneration(unittest.TestCase):
         mock_render.assert_not_called()
         self.assertIn("贵州茅台", out)
         self.assertIn("600519", out)
+
+    @mock.patch("src.notification.get_config")
+    def test_generate_mobile_report_compacts_citations_for_phone_reading(self, mock_get_config: mock.MagicMock):
+        mock_get_config.return_value = _make_config(report_renderer_enabled=False)
+        service = NotificationService()
+        result = AnalysisResult(
+            code="600519",
+            name="贵州茅台",
+            sentiment_score=72,
+            trend_prediction="看多",
+            operation_advice="持有",
+            analysis_summary="继续跟踪【依据：2026-04-20 财联社《公司发布年度分红方案》】",
+            dashboard={
+                "core_conclusion": {
+                    "one_sentence": "等待回踩后再考虑加仓【依据：2026-04-20 财联社《公司发布年度分红方案》】",
+                },
+                "intelligence": {
+                    "earnings_outlook": "业绩预告显示净利润同比增长约20%【依据：2026-04-19 证券时报《机构维持买入评级》】",
+                    "sentiment_summary": "市场情绪中性，因为正向线索1条、风险线索0条【依据：2026-04-20 财联社《公司发布年度分红方案》】",
+                },
+                "battle_plan": {
+                    "sniper_points": {
+                        "ideal_buy": "190附近",
+                        "stop_loss": "182",
+                        "take_profit": "205",
+                    }
+                },
+            },
+            current_price=193.6,
+            change_pct=1.8,
+        )
+
+        out = service.generate_mobile_report([result], report_date="2026-04-21")
+
+        self.assertIn("贵州茅台(600519)", out)
+        self.assertIn("【依据：", out)
+        self.assertIn("🎯", out)
+        self.assertIn("🛑", out)
+        self.assertIn("价格 193.6", out)
 
     @mock.patch("src.notification.get_config")
     def test_generate_dashboard_report_localizes_english_fallback(self, mock_get_config: mock.MagicMock):
@@ -318,9 +406,52 @@ class TestNotificationServiceReportGeneration(unittest.TestCase):
 
         out = service.generate_single_stock_report(result)
 
-        self.assertIn("Core Conclusion", out)
-        self.assertIn("Action Levels", out)
+        self.assertIn("Wait for confirmation", out)
+        self.assertIn("Levels", out)
         self.assertIn("Hold", out)
+
+    @mock.patch("src.notification.get_config")
+    def test_generate_single_stock_report_compacts_intel_lines_for_mobile(self, mock_get_config: mock.MagicMock):
+        mock_get_config.return_value = _make_config(report_renderer_enabled=False)
+        service = NotificationService()
+        result = AnalysisResult(
+            code="600519",
+            name="贵州茅台",
+            sentiment_score=68,
+            trend_prediction="震荡偏多",
+            operation_advice="持有",
+            analysis_summary="等待回踩确认【依据：2026-04-20 财联社《公司发布年度分红方案》】",
+            dashboard={
+                "core_conclusion": {
+                    "one_sentence": "等待回踩确认【依据：2026-04-20 财联社《公司发布年度分红方案》】",
+                    "position_advice": {
+                        "no_position": "回踩 MA5 不破再考虑小仓试错【依据：2026-04-20 财联社《公司发布年度分红方案》】",
+                        "has_position": "继续持有但关注 182 止损【依据：2026-04-19 证券时报《机构维持买入评级》】",
+                    },
+                },
+                "intelligence": {
+                    "earnings_outlook": "业绩预告显示净利润同比增长约20%【依据：2026-04-19 证券时报《机构维持买入评级》】",
+                    "sentiment_summary": "市场情绪中性，因为正向线索1条、风险线索0条【依据：2026-04-20 财联社《公司发布年度分红方案》】",
+                },
+                "battle_plan": {
+                    "sniper_points": {
+                        "ideal_buy": "190附近",
+                        "stop_loss": "182",
+                        "take_profit": "205",
+                    }
+                },
+            },
+            current_price=193.6,
+            change_pct=1.8,
+        )
+
+        out = service.generate_single_stock_report(result)
+
+        self.assertIn("【依据：", out)
+        self.assertIn("📊", out)
+        self.assertIn("策略", out)
+        self.assertIn("价格 193.6", out)
+        self.assertNotIn("| 190附近 | 182 | 205 |", out)
 
     @mock.patch("src.notification.get_config")
     def test_history_compare_context_uses_cache(self, mock_get_config: mock.MagicMock):
@@ -336,16 +467,16 @@ class TestNotificationServiceReportGeneration(unittest.TestCase):
             query_id="q-1",
         )
 
-        with mock.patch(
-            "src.services.history_comparison_service.get_signal_changes_batch",
-            return_value={"600519": []},
-        ) as mock_batch:
+        history_module = types.ModuleType("src.services.history_comparison_service")
+        history_module.get_signal_changes_batch = mock.MagicMock(return_value={"600519": []})
+
+        with mock.patch.dict(sys.modules, {"src.services.history_comparison_service": history_module}):
             first = service._get_history_compare_context([result])
             second = service._get_history_compare_context([result])
 
         self.assertEqual(first, {"history_by_code": {"600519": []}})
         self.assertEqual(second, {"history_by_code": {"600519": []}})
-        mock_batch.assert_called_once()
+        history_module.get_signal_changes_batch.assert_called_once()
 
     @mock.patch("src.notification.get_config")
     @mock.patch("smtplib.SMTP_SSL")

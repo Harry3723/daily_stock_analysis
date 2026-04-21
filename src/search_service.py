@@ -2114,6 +2114,18 @@ class SearchService:
     NEWS_OVERSAMPLE_FACTOR = 2
     NEWS_OVERSAMPLE_MAX = 10
     FUTURE_TOLERANCE_DAYS = 1
+    # Time-sensitive dimensions keep the regular freshness window; slower-moving
+    # dimensions get a larger lower bound so scheduled reports are less likely
+    # to miss earnings / research context simply because the default news window
+    # is only a few days.
+    INTEL_DIMENSION_MIN_WINDOWS = {
+        "latest_news": 0,
+        "announcements": 0,
+        "market_analysis": 30,
+        "risk_check": 0,
+        "earnings": 45,
+        "industry": 30,
+    }
     _CHINESE_TEXT_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
     _US_STOCK_RE = re.compile(r"^[A-Za-z]{1,5}(\.[A-Za-z])?$")
 
@@ -2712,6 +2724,139 @@ class SearchService:
             search_time=response.search_time,
         )
 
+    @classmethod
+    def _intel_dimension_search_days(
+        cls,
+        dimension_name: str,
+        *,
+        base_days: int,
+        is_index_etf: bool,
+    ) -> int:
+        """Return the effective search window for a comprehensive-intel dimension."""
+        minimum = cls.INTEL_DIMENSION_MIN_WINDOWS.get(dimension_name, 0)
+        if dimension_name == "risk_check" and is_index_etf:
+            minimum = max(minimum, 30)
+        return max(max(1, int(base_days)), minimum)
+
+    @staticmethod
+    def _search_result_identity(item: SearchResult) -> Tuple[str, str]:
+        """Stable dedupe key for merged provider results."""
+        normalized_url = (item.url or "").strip().lower()
+        normalized_title = re.sub(r"\s+", " ", (item.title or "").strip().lower())
+        return normalized_url, normalized_title
+
+    @classmethod
+    def _merge_search_results(
+        cls,
+        merged_results: List[SearchResult],
+        seen: set[Tuple[str, str]],
+        incoming: SearchResponse,
+        *,
+        max_results: int,
+    ) -> None:
+        """Append deduplicated search results in-order."""
+        if not incoming.success or not incoming.results:
+            return
+        for item in incoming.results:
+            key = cls._search_result_identity(item)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged_results.append(item)
+            if len(merged_results) >= max_results:
+                break
+
+    def _search_intel_dimension(
+        self,
+        *,
+        stock_code: str,
+        dimension: Dict[str, Any],
+        provider_order: List[BaseSearchProvider],
+        search_days: int,
+        target_per_dimension: int,
+        provider_max_results: int,
+    ) -> SearchResponse:
+        """Search one intelligence dimension across providers until enough results are collected."""
+        merged_results: List[SearchResult] = []
+        seen: set[Tuple[str, str]] = set()
+        used_providers: List[str] = []
+        error_messages: List[str] = []
+        had_provider_success = False
+
+        for provider in provider_order:
+            logger.info(
+                "[情报搜索] %s: 使用 %s (window=%s days)",
+                dimension["desc"],
+                provider.name,
+                search_days,
+            )
+
+            if isinstance(provider, TavilySearchProvider) and dimension.get("tavily_topic"):
+                response = provider.search(
+                    dimension["query"],
+                    max_results=provider_max_results,
+                    days=search_days,
+                    topic=dimension["tavily_topic"],
+                )
+            else:
+                response = provider.search(
+                    dimension["query"],
+                    max_results=provider_max_results,
+                    days=search_days,
+                )
+
+            if dimension["strict_freshness"]:
+                filtered_response = self._filter_news_response(
+                    response,
+                    search_days=search_days,
+                    max_results=target_per_dimension,
+                    log_scope=f"{stock_code}:{provider.name}:{dimension['name']}",
+                )
+            else:
+                filtered_response = self._normalize_and_limit_response(
+                    response,
+                    max_results=target_per_dimension,
+                )
+
+            had_provider_success = had_provider_success or bool(response.success)
+            if response.success:
+                used_providers.append(provider.name)
+                logger.info(
+                    "[情报搜索] %s/%s: 原始=%s条, 过滤后=%s条",
+                    dimension["desc"],
+                    provider.name,
+                    len(response.results),
+                    len(filtered_response.results),
+                )
+                self._merge_search_results(
+                    merged_results,
+                    seen,
+                    filtered_response,
+                    max_results=target_per_dimension,
+                )
+                if len(merged_results) >= target_per_dimension:
+                    break
+            else:
+                logger.warning(
+                    "[情报搜索] %s/%s: 搜索失败 - %s",
+                    dimension["desc"],
+                    provider.name,
+                    response.error_message,
+                )
+                if response.error_message:
+                    error_messages.append(f"{provider.name}:{response.error_message}")
+
+            time.sleep(0.3)
+
+        provider_label = " + ".join(dict.fromkeys(used_providers)) if used_providers else "None"
+        return SearchResponse(
+            query=dimension["query"],
+            results=merged_results[:target_per_dimension],
+            provider=provider_label,
+            success=bool(merged_results) or had_provider_success,
+            error_message=" | ".join(error_messages) if error_messages else None,
+        )
+
     def search_stock_news(
         self,
         stock_code: str,
@@ -3086,7 +3231,7 @@ class SearchService:
                 },
             ]
         
-        search_days = self._effective_news_window_days()
+        base_search_days = self._effective_news_window_days()
         target_per_dimension = 3
         provider_max_results = self._provider_request_size(target_per_dimension)
 
@@ -3097,7 +3242,7 @@ class SearchService:
             ),
             stock_name,
             stock_code,
-            search_days,
+            base_search_days,
             self.news_strategy_profile,
             self.news_max_age_days,
             target_per_dimension,
@@ -3107,61 +3252,42 @@ class SearchService:
         # 轮流使用不同的搜索引擎
         provider_index = 0
         
+        available_providers = [p for p in self._providers if p.is_available]
         for dim in search_dimensions:
             if search_count >= max_searches:
                 break
-            
-            # 选择搜索引擎（轮流使用）
-            available_providers = [p for p in self._providers if p.is_available]
             if not available_providers:
                 break
-            
-            provider = available_providers[provider_index % len(available_providers)]
-            provider_index += 1
-            
-            logger.info(f"[情报搜索] {dim['desc']}: 使用 {provider.name}")
 
-            if isinstance(provider, TavilySearchProvider) and dim.get('tavily_topic'):
-                response = provider.search(
-                    dim['query'],
-                    max_results=provider_max_results,
-                    days=search_days,
-                    topic=dim['tavily_topic'],
-                )
-            else:
-                response = provider.search(
-                    dim['query'],
-                    max_results=provider_max_results,
-                    days=search_days,
-                )
-            if dim['strict_freshness']:
-                filtered_response = self._filter_news_response(
-                    response,
-                    search_days=search_days,
-                    max_results=target_per_dimension,
-                    log_scope=f"{stock_code}:{provider.name}:{dim['name']}",
-                )
-            else:
-                filtered_response = self._normalize_and_limit_response(
-                    response,
-                    max_results=target_per_dimension,
-                )
-            results[dim['name']] = filtered_response
+            start_index = provider_index % len(available_providers)
+            provider_index += 1
+            provider_order = available_providers[start_index:] + available_providers[:start_index]
+            dimension_days = self._intel_dimension_search_days(
+                dim["name"],
+                base_days=base_search_days,
+                is_index_etf=is_index_etf,
+            )
+            merged_response = self._search_intel_dimension(
+                stock_code=stock_code,
+                dimension=dim,
+                provider_order=provider_order,
+                search_days=dimension_days,
+                target_per_dimension=target_per_dimension,
+                provider_max_results=provider_max_results,
+            )
+            results[dim['name']] = merged_response
             search_count += 1
-            
-            if response.success:
+
+            if merged_response.success:
                 logger.info(
-                    "[情报搜索] %s: 原始=%s条, 过滤后=%s条",
+                    "[情报搜索] %s: 聚合后=%s条, provider=%s",
                     dim['desc'],
-                    len(response.results),
-                    len(filtered_response.results),
+                    len(merged_response.results),
+                    merged_response.provider,
                 )
             else:
-                logger.warning(f"[情报搜索] {dim['desc']}: 搜索失败 - {response.error_message}")
-            
-            # 短暂延迟避免请求过快
-            time.sleep(0.5)
-        
+                logger.warning(f"[情报搜索] {dim['desc']}: 搜索失败 - {merged_response.error_message}")
+
         return results
     
     def format_intel_report(self, intel_results: Dict[str, SearchResponse], stock_name: str) -> str:
@@ -3203,13 +3329,17 @@ class SearchService:
                 # 增加显示条数
                 for i, r in enumerate(resp.results[:4], 1):
                     date_str = f" [{r.published_date}]" if r.published_date else ""
-                    lines.append(f"  {i}. {r.title}{date_str}")
+                    source_str = r.source or "来源未知"
+                    lines.append(f"  {i}. [{source_str}]{date_str} {r.title}")
                     # 如果摘要太短，可能信息量不足
                     snippet = r.snippet[:150] if len(r.snippet) > 20 else r.snippet
-                    lines.append(f"     {snippet}...")
+                    if snippet:
+                        lines.append(f"     摘要: {snippet}...")
+                    if r.url:
+                        lines.append(f"     证据: {source_str}{date_str} | {r.url}")
             else:
-                lines.append("  未找到相关信息")
-        
+                lines.append("  未找到相关信息（缺失记录：本维度为空，输出时必须明确说明信息缺失，禁止编造）")
+
         return "\n".join(lines)
     
     def batch_search(

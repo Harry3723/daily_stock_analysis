@@ -8,6 +8,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+from types import ModuleType
 
 # Mock newspaper before search_service import (optional dependency)
 if "newspaper" not in sys.modules:
@@ -15,6 +16,38 @@ if "newspaper" not in sys.modules:
     mock_np.Article = MagicMock()
     mock_np.Config = MagicMock()
     sys.modules["newspaper"] = mock_np
+
+# Mock tenacity before search_service import (optional dependency)
+if "tenacity" not in sys.modules:
+    tenacity_stub = ModuleType("tenacity")
+
+    def _retry(*args, **kwargs):
+        def _decorator(func):
+            return func
+        return _decorator
+
+    tenacity_stub.retry = _retry
+    tenacity_stub.stop_after_attempt = lambda *args, **kwargs: None
+    tenacity_stub.wait_exponential = lambda *args, **kwargs: None
+    tenacity_stub.retry_if_exception_type = lambda *args, **kwargs: None
+    tenacity_stub.before_sleep_log = lambda *args, **kwargs: None
+    sys.modules["tenacity"] = tenacity_stub
+
+if "dotenv" not in sys.modules:
+    dotenv_stub = ModuleType("dotenv")
+    dotenv_stub.load_dotenv = lambda *args, **kwargs: None
+    dotenv_stub.dotenv_values = lambda *args, **kwargs: {}
+    sys.modules["dotenv"] = dotenv_stub
+
+if "fake_useragent" not in sys.modules:
+    fake_useragent_stub = ModuleType("fake_useragent")
+
+    class _DummyUserAgent:
+        random = "Mozilla/5.0"
+        chrome = "Mozilla/5.0"
+
+    fake_useragent_stub.UserAgent = _DummyUserAgent
+    sys.modules["fake_useragent"] = fake_useragent_stub
 
 from src.search_service import SearchResponse, SearchResult, SearchService
 
@@ -342,10 +375,12 @@ class SearchNewsFreshnessTestCase(unittest.TestCase):
             )
 
         self.assertGreaterEqual(mock_search.call_count, 1)
+        requested_days = []
         for call in mock_search.call_args_list:
             kwargs = call[1]
-            self.assertEqual(kwargs["days"], 3)
+            requested_days.append(kwargs["days"])
             self.assertEqual(kwargs["max_results"], 6)  # target 3 -> overfetch 6
+        self.assertEqual(requested_days, [3, 30])
 
         self.assertEqual([item.title for item in intel["latest_news"].results], ["fresh"])
         self.assertEqual(
@@ -495,6 +530,71 @@ class SearchNewsFreshnessTestCase(unittest.TestCase):
             )
 
         self.assertIn("announcements", intel)
+
+    def test_search_comprehensive_intel_expands_earnings_window_and_falls_back_to_next_provider(self) -> None:
+        """Earnings dimension should use a wider window and continue to the next provider on empty results."""
+        today = datetime.now().date()
+        fresh = today.isoformat()
+        earnings_date = (today - timedelta(days=10)).isoformat()
+        call_log = []
+
+        service = SearchService(
+            bocha_keys=["dummy_key"],
+            searxng_public_instances_enabled=False,
+            news_max_age_days=3,
+            news_strategy_profile="short",
+        )
+
+        def _is_earnings_query(query: str) -> bool:
+            lowered = query.lower()
+            return "业绩预告" in query or "earnings" in lowered
+
+        def _provider_one(query: str, max_results: int = 3, days: int = 3, **kwargs):
+            call_log.append(("P1", query, days))
+            if _is_earnings_query(query):
+                return _response([])
+            return _response([_result("provider_one_hit", fresh)])
+
+        def _provider_two(query: str, max_results: int = 3, days: int = 3, **kwargs):
+            call_log.append(("P2", query, days))
+            if _is_earnings_query(query):
+                return _response([_result("earnings_hit", earnings_date)])
+            return _response([_result("provider_two_hit", fresh)])
+
+        service._providers = [
+            SimpleNamespace(is_available=True, name="P1", search=MagicMock(side_effect=_provider_one)),
+            SimpleNamespace(is_available=True, name="P2", search=MagicMock(side_effect=_provider_two)),
+        ]
+
+        with patch("src.search_service.time.sleep"):
+            intel = service.search_comprehensive_intel(
+                stock_code="600519",
+                stock_name="贵州茅台",
+                max_searches=5,
+            )
+
+        earnings_calls = [entry for entry in call_log if _is_earnings_query(entry[1])]
+        self.assertEqual([entry[0] for entry in earnings_calls], ["P1", "P2"])
+        self.assertTrue(all(entry[2] == 45 for entry in earnings_calls))
+        self.assertEqual([item.title for item in intel["earnings"].results], ["earnings_hit"])
+        self.assertEqual(intel["earnings"].results[0].published_date, earnings_date)
+
+    def test_format_intel_report_includes_evidence_and_missing_record(self) -> None:
+        """Formatted intel report should expose citation lines and explicit missing records."""
+        service, _ = self._create_service_with_mock_provider(
+            news_max_age_days=3,
+            news_strategy_profile="short",
+        )
+        fresh = datetime.now().date().isoformat()
+        intel = {
+            "latest_news": _response([_result("headline", fresh)]),
+            "earnings": _response([]),
+        }
+
+        report = service.format_intel_report(intel, "贵州茅台")
+        self.assertIn("证据:", report)
+        self.assertIn("https://example.com/headline", report)
+        self.assertIn("缺失记录", report)
 
     def test_effective_window_helper_has_no_side_effect(self) -> None:
         """_effective_news_window_days should not mutate stored news_window_days."""
